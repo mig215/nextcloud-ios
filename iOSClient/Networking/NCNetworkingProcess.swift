@@ -321,6 +321,13 @@ actor NCNetworkingProcess {
 
                 await runMetadataPipelineAsync(metadatas: metadatas)
 
+                // Remove uploaded assets as soon as they qualify, independently of
+                // whatever else is still in the queue: gating this on the *entire*
+                // queue being empty (see below) meant any unrelated pending transfer
+                // (a download, a different account's upload, …) starved deletion
+                // indefinitely, since it's rare for the queue to ever be fully idle.
+                await removeUploadedAssetsIfNeeded()
+
                 await updateTimerIntervalIfNeeded(hasPendingTransfers: true)
             } else {
                 // Remove upload asset
@@ -334,6 +341,13 @@ actor NCNetworkingProcess {
         }
     }
 
+    /// Deletes camera roll assets whose upload has already completed, when the
+    /// user has enabled "remove after upload". `PHAssetChangeRequest.deleteAssets`
+    /// always raises the native "Delete X Photos?" confirmation sheet, which needs
+    /// an active foreground app — so this must only ever be called from the
+    /// foreground polling timer above, never from a background task. It is no
+    /// longer gated on the *entire* transfer queue being idle (see call sites),
+    /// only on the asset's own upload having actually completed.
     private func removeUploadedAssetsIfNeeded() async {
         guard NCPreferences().removePhotoCameraRoll,
               let localIdentifiers = await NCManageDatabase.shared.getAssetLocalIdentifiersUploadedAsync(),

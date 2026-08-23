@@ -1303,7 +1303,13 @@ extension NCManageDatabase {
 
     func getAssetLocalIdentifiersUploadedAsync() async -> [String]? {
         return await core.performRealmReadAsync { realm in
-            let results = realm.objects(tableMetadata.self).filter("assetLocalIdentifier != ''")
+            // Only consider assets whose upload actually completed. Relying on the
+            // caller's transfer queue being globally empty as a proxy for "done" is
+            // unreliable (any unrelated pending download/upload starves cleanup) and,
+            // if that proxy were ever removed, this filter is what stands between a
+            // still in-flight upload and a premature deletion from the camera roll.
+            let results = realm.objects(tableMetadata.self)
+                .filter("assetLocalIdentifier != '' AND status == %d", NCGlobal.shared.metadataStatusNormal)
             return results.map { $0.assetLocalIdentifier }
         }
     }
