@@ -31,6 +31,8 @@ actor NCNetworkingProcess {
     private var lastScheduledAndInProgressCount: Int = 0
     private var lastVerifyZombieDate: Date = .distantPast
     private let verifyZombieInterval: TimeInterval = 12
+    private var lastAssetRemovalDate: Date = .distantPast
+    private let removeUploadedAssetsInterval: TimeInterval = 300
 
     private var timer: DispatchSourceTimer?
     private let timerQueue = DispatchQueue(label: "com.nextcloud.timerProcess", qos: .utility)
@@ -326,12 +328,12 @@ actor NCNetworkingProcess {
                 // queue being empty (see below) meant any unrelated pending transfer
                 // (a download, a different account's upload, …) starved deletion
                 // indefinitely, since it's rare for the queue to ever be fully idle.
-                await removeUploadedAssetsIfNeeded()
+                await removeUploadedAssetsIfNeeded(queueIsEmpty: false)
 
                 await updateTimerIntervalIfNeeded(hasPendingTransfers: true)
             } else {
                 // Remove upload asset
-                await removeUploadedAssetsIfNeeded()
+                await removeUploadedAssetsIfNeeded(queueIsEmpty: true)
 
                 // Set Live Photo
                 await NCNetworking.shared.setLivePhoto(account: currentAccount)
@@ -348,12 +350,31 @@ actor NCNetworkingProcess {
     /// foreground polling timer above, never from a background task. It is no
     /// longer gated on the *entire* transfer queue being idle (see call sites),
     /// only on the asset's own upload having actually completed.
-    private func removeUploadedAssetsIfNeeded() async {
-        guard NCPreferences().removePhotoCameraRoll,
-              let localIdentifiers = await NCManageDatabase.shared.getAssetLocalIdentifiersUploadedAsync(),
+    ///
+    /// While other work is still queued, this is additionally debounced to at most
+    /// once every `removeUploadedAssetsInterval` — otherwise every single asset
+    /// finishing its upload during a busy stretch (a whole camera-roll backlog,
+    /// say) pops its own native confirmation sheet in quick succession, which is
+    /// disruptive without adding safety. `getAssetLocalIdentifiersUploadedAsync`
+    /// always returns *every* currently-eligible asset, not just newly-finished
+    /// ones, so delaying the call only batches more assets into one prompt — it
+    /// never causes an eligible asset to be skipped. Once the queue is empty there
+    /// is nothing left to batch with, so the wait is skipped and cleanup runs
+    /// immediately instead of leaving the last batch stranded until the interval
+    /// happens to elapse.
+    private func removeUploadedAssetsIfNeeded(queueIsEmpty: Bool) async {
+        guard NCPreferences().removePhotoCameraRoll else {
+            return
+        }
+        guard queueIsEmpty || Date().timeIntervalSince(lastAssetRemovalDate) >= removeUploadedAssetsInterval else {
+            return
+        }
+        guard let localIdentifiers = await NCManageDatabase.shared.getAssetLocalIdentifiersUploadedAsync(),
               !localIdentifiers.isEmpty else {
             return
         }
+
+        lastAssetRemovalDate = Date()
 
          _ = await withCheckedContinuation { continuation in
             PHPhotoLibrary.shared().performChanges({
