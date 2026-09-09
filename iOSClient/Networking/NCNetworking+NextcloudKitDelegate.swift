@@ -162,6 +162,15 @@ extension NCNetworking {
                                                                                        etag: etag,
                                                                                        ownerId: ownerId,
                                                                                        permissions: permissions)
+                        // Flush right away instead of waiting for NCNetworkingProcess's
+                        // foreground timer to notice and flush this buffer eventually.
+                        // That timer can be stalled indefinitely (a single stuck asset
+                        // extraction wedges its single-flight task, see NCCameraRoll) or
+                        // simply never get another tick before the app is killed — either
+                        // way the buffered success would sit invisible to everything,
+                        // including "remove after upload" cleanup, which only ever sees a
+                        // completed upload once it's durably written with status = Normal.
+                        await NCNetworking.shared.metadataUploadTranfersSuccess.flush()
 #endif
                     }
                 } else {
