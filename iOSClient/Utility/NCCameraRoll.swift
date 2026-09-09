@@ -338,13 +338,6 @@ final class NCCameraRoll: CameraRollExtractor {
         init(_ value: Value) { self.value = value }
     }
 
-    /// Same idea as RequestIDBox, for PHAssetResourceManager's request id type.
-    /// Optional because (unlike PHImageRequestID) there's no public "invalid id"
-    /// sentinel to default to.
-    private final class ResourceRequestIDBox: @unchecked Sendable {
-        var value: PHAssetResourceDataRequestID?
-    }
-
     /// Races `operation` against `extractionTimeout`. If the timeout wins,
     /// `onTimeout` is invoked to actively cancel whatever `operation` started —
     /// both `PHImageManager.cancelImageRequest` and `AVAssetExportSession.cancelExport()`
@@ -506,33 +499,53 @@ final class NCCameraRoll: CameraRollExtractor {
         return AVFileType(rawValue: contentType.identifier)
     }
 
+    /// Guards a `CheckedContinuation` that two independent sides might try to
+    /// resume (the real completion, and a timeout) — `claim()` returns true for
+    /// only the first caller, so at most one of them actually calls `resume`.
+    private final class ResumeGuard: @unchecked Sendable {
+        private let lock = NSLock()
+        private var alreadyClaimed = false
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !alreadyClaimed else { return false }
+            alreadyClaimed = true
+            return true
+        }
+    }
+
     /// Writes `resource`'s data to `fileURL`, bounded by `extractionTimeout`.
     /// PHAssetResourceManager has the same hang risk as PHImageManager above: a
     /// resource that needs an iCloud download can stall indefinitely, and this is
     /// reached from the same extractCameraRoll call that must not hang forever.
+    ///
+    /// Unlike PHImageManager's requests, `writeData(for:toFile:options:completionHandler:)`
+    /// returns no request id — there is nothing here to actively cancel on timeout,
+    /// so this can't reuse withExtractionTimeout: that helper's task group waits for
+    /// every child to finish before returning, which would hang forever with no way
+    /// to force the write's completion handler to fire early. Race it manually
+    /// instead — whichever side finishes first (the write, or the timeout) resumes
+    /// the continuation; the loser's eventual callback becomes a harmless no-op. The
+    /// write may keep running as an orphaned operation after that, but this function
+    /// itself reliably returns within `extractionTimeout`.
     private func writeResourceData(_ resource: PHAssetResource, to fileURL: URL, options: PHAssetResourceRequestOptions) async -> Error? {
         nonisolated(unsafe) let resource = resource
         nonisolated(unsafe) let options = options
-        let requestIDBox = ResourceRequestIDBox()
-        do {
-            try await withExtractionTimeout(onTimeout: {
-                if let requestID = requestIDBox.value {
-                    PHAssetResourceManager.default().cancelDataRequest(requestID)
-                }
-            }) {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    requestIDBox.value = PHAssetResourceManager.default().writeData(for: resource, toFile: fileURL, options: options) { error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else {
-                            continuation.resume()
-                        }
-                    }
+        let resumeGuard = ResumeGuard()
+
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
+            PHAssetResourceManager.default().writeData(for: resource, toFile: fileURL, options: options) { error in
+                if resumeGuard.claim() {
+                    continuation.resume(returning: error)
                 }
             }
-            return nil
-        } catch {
-            return error
+
+            Task {
+                try? await Task.sleep(for: Self.extractionTimeout)
+                if resumeGuard.claim() {
+                    continuation.resume(returning: NSError(domain: "ExtractAssetError", code: 9, userInfo: [NSLocalizedDescriptionKey: "Asset extraction timed out"]))
+                }
+            }
         }
     }
 
