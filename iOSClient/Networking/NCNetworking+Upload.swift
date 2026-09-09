@@ -172,12 +172,12 @@ extension NCNetworking {
 
             backupFile = file
         } catch is CancellationError {
-            backupError = NKError(errorCode: -5, errorDescription: "Transfers was cancelled.")
-            await uploadCancelFile(metadata: metadata, directoryChunks: directory)
+            backupError = NKError(errorCode: NSURLErrorCancelled, errorDescription: "Transfer was cancelled.")
+            await cancelChunkUpload(metadata: metadata, directoryChunks: directory, error: backupError)
         } catch let error as NKError {
             backupError = error
-            if error.errorCode == -5 {
-                await uploadCancelFile(metadata: metadata, directoryChunks: directory)
+            if error.errorCode == NSURLErrorCancelled {
+                await cancelChunkUpload(metadata: metadata, directoryChunks: directory, error: error)
             } else {
                 if performPostProcessing {
                     await uploadError(withMetadata: metadata, error: error)
@@ -191,6 +191,27 @@ extension NCNetworking {
         }
 
         return(metadata.account, backupFile, backupError)
+    }
+
+    /// Handles a cancelled chunk upload. `NCNetworkingProcess` calls `cancelCurrentUpload()`
+    /// on *every* app-background transition, not just an explicit user action (its banner's
+    /// cancel button uses the very same call) — so unconditionally treating a cancellation as
+    /// "discard this upload" deleted auto-uploaded videos outright the moment the app was
+    /// backgrounded mid-upload, with no error status and nothing left to retry. Worse, since
+    /// NCAutoUpload's discovery bookmark already advances past an asset the moment it's first
+    /// queued, that asset was never offered to the pipeline again either — permanently dropped,
+    /// though still safely left in the camera roll (upload never having succeeded).
+    ///
+    /// Mirror the policy `uploadError(withMetadata:)` already applies for the non-chunk upload
+    /// path: an automatic upload is requeued for retry — the chunks already written to disk let
+    /// that retry resume instead of restarting from scratch — while anything else (a manual,
+    /// user-initiated upload) is treated as a genuine cancellation and discarded, chunks included.
+    private func cancelChunkUpload(metadata: tableMetadata, directoryChunks: String, error: NKError) async {
+        if metadata.sessionSelector == self.global.selectorUploadAutoUpload {
+            await uploadError(withMetadata: metadata, error: error)
+        } else {
+            await uploadCancelFile(metadata: metadata, directoryChunks: directoryChunks)
+        }
     }
 
     // MARK: - Upload file in background
