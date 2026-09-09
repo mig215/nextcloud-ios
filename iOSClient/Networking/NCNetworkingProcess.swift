@@ -483,7 +483,24 @@ actor NCNetworkingProcess {
             guard timer != nil else { return }
             // no extract photo
             if extractMetadatas.isEmpty {
-                await database.deleteMetadataAsync(id: metadata.ocId)
+                // Empty can mean two different things: the asset was removed from
+                // the photo library before we got to it (nothing left to upload,
+                // safe to drop), or extraction itself failed/timed out while the
+                // asset is still there (a stalled iCloud fetch, a transient I/O
+                // error, ...). Only the first case should delete the queued
+                // upload outright — the second should be retried, the same way
+                // any other upload failure already is.
+                let assetStillExists = !metadata.assetLocalIdentifier.isEmpty &&
+                    PHAsset.fetchAssets(withLocalIdentifiers: [metadata.assetLocalIdentifier], options: nil).firstObject != nil
+
+                if assetStillExists {
+                    await database.setMetadataSessionAsync(ocId: metadata.ocId,
+                                                            sessionTaskIdentifier: 0,
+                                                            sessionError: "Asset extraction failed",
+                                                            status: global.metadataStatusUploadError)
+                } else {
+                    await database.deleteMetadataAsync(id: metadata.ocId)
+                }
             }
             // upload file(s)
             for metadata in extractMetadatas {

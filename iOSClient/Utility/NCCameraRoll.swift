@@ -338,6 +338,13 @@ final class NCCameraRoll: CameraRollExtractor {
         init(_ value: Value) { self.value = value }
     }
 
+    /// Same idea as RequestIDBox, for PHAssetResourceManager's request id type.
+    /// Optional because (unlike PHImageRequestID) there's no public "invalid id"
+    /// sentinel to default to.
+    private final class ResourceRequestIDBox: @unchecked Sendable {
+        var value: PHAssetResourceDataRequestID?
+    }
+
     /// Races `operation` against `extractionTimeout`. If the timeout wins,
     /// `onTimeout` is invoked to actively cancel whatever `operation` started —
     /// both `PHImageManager.cancelImageRequest` and `AVAssetExportSession.cancelExport()`
@@ -499,6 +506,36 @@ final class NCCameraRoll: CameraRollExtractor {
         return AVFileType(rawValue: contentType.identifier)
     }
 
+    /// Writes `resource`'s data to `fileURL`, bounded by `extractionTimeout`.
+    /// PHAssetResourceManager has the same hang risk as PHImageManager above: a
+    /// resource that needs an iCloud download can stall indefinitely, and this is
+    /// reached from the same extractCameraRoll call that must not hang forever.
+    private func writeResourceData(_ resource: PHAssetResource, to fileURL: URL, options: PHAssetResourceRequestOptions) async -> Error? {
+        nonisolated(unsafe) let resource = resource
+        nonisolated(unsafe) let options = options
+        let requestIDBox = ResourceRequestIDBox()
+        do {
+            try await withExtractionTimeout(onTimeout: {
+                if let requestID = requestIDBox.value {
+                    PHAssetResourceManager.default().cancelDataRequest(requestID)
+                }
+            }) {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    requestIDBox.value = PHAssetResourceManager.default().writeData(for: resource, toFile: fileURL, options: options) { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                }
+            }
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     /// Represents a camera roll extractor that creates metadata for Live Photos.
     /// This method is compatible with Swift 6, avoids non-Sendable captures,
     /// and performs safe background processing.
@@ -546,41 +583,39 @@ final class NCCameraRoll: CameraRollExtractor {
         let capturedDate = metadata.date
         let capturedUploadDate = metadata.uploadDate
 
-        // Write video resource to file and create metadata
-        return await withCheckedContinuation { (continuation: CheckedContinuation<tableMetadata?, Never>) in
-            PHAssetResourceManager.default().writeData(for: resource, toFile: URL(fileURLWithPath: fileNamePath), options: options) { error in
-                guard error == nil else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                NCManageDatabaseCreateMetadata().createMetadata(
-                    fileName: fileName,
-                    ocId: ocId,
-                    serverUrl: capturedServerUrl,
-                    session: session,
-                    sceneIdentifier: capturedSceneIdentifier) { metadataLivePhoto in
-                    metadataLivePhoto.livePhotoFile = capturedLivePhotoFile
-                    metadataLivePhoto.isExtractFile = true
-                    metadataLivePhoto.session = capturedSession
-                    metadataLivePhoto.sessionSelector = capturedSessionSelector
-                    do {
-                        let attributes = try FileManager.default.attributesOfItem(atPath: fileNamePath)
-                        metadataLivePhoto.size = attributes[FileAttributeKey.size] as? Int64 ?? 0
-                    } catch {
-                        print(error)
-                    }
-                    metadataLivePhoto.status = capturedStatus
-                    metadataLivePhoto.chunk = metadataLivePhoto.size > chunkSize ? chunkSize : 0
-                    metadataLivePhoto.e2eEncrypted = capturedIsDirectoryE2EE
-                    if metadataLivePhoto.chunk > 0 || metadataLivePhoto.e2eEncrypted {
-                        metadataLivePhoto.session = NCNetworking.shared.sessionUpload
-                    }
-                    metadataLivePhoto.creationDate = capturedCreationDate
-                    metadataLivePhoto.date = capturedDate
-                    metadataLivePhoto.uploadDate = capturedUploadDate
+        // Write video resource to file, then create metadata
+        guard await writeResourceData(resource, to: URL(fileURLWithPath: fileNamePath), options: options) == nil else {
+            return nil
+        }
 
-                    continuation.resume(returning: metadataLivePhoto)
+        return await withCheckedContinuation { (continuation: CheckedContinuation<tableMetadata?, Never>) in
+            NCManageDatabaseCreateMetadata().createMetadata(
+                fileName: fileName,
+                ocId: ocId,
+                serverUrl: capturedServerUrl,
+                session: session,
+                sceneIdentifier: capturedSceneIdentifier) { metadataLivePhoto in
+                metadataLivePhoto.livePhotoFile = capturedLivePhotoFile
+                metadataLivePhoto.isExtractFile = true
+                metadataLivePhoto.session = capturedSession
+                metadataLivePhoto.sessionSelector = capturedSessionSelector
+                do {
+                    let attributes = try FileManager.default.attributesOfItem(atPath: fileNamePath)
+                    metadataLivePhoto.size = attributes[FileAttributeKey.size] as? Int64 ?? 0
+                } catch {
+                    print(error)
                 }
+                metadataLivePhoto.status = capturedStatus
+                metadataLivePhoto.chunk = metadataLivePhoto.size > chunkSize ? chunkSize : 0
+                metadataLivePhoto.e2eEncrypted = capturedIsDirectoryE2EE
+                if metadataLivePhoto.chunk > 0 || metadataLivePhoto.e2eEncrypted {
+                    metadataLivePhoto.session = NCNetworking.shared.sessionUpload
+                }
+                metadataLivePhoto.creationDate = capturedCreationDate
+                metadataLivePhoto.date = capturedDate
+                metadataLivePhoto.uploadDate = capturedUploadDate
+
+                continuation.resume(returning: metadataLivePhoto)
             }
         }
     }
