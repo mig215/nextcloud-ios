@@ -313,23 +313,86 @@ final class NCCameraRoll: CameraRollExtractor {
         return await self.database.addAndReturnMetadataAsync(metadata)
     }
 
-    private func extractImage(asset: PHAsset, ext: String, filePath: String, convertToJPEG: Bool) async throws {
-        let imageData: Data = try await withCheckedThrowingContinuation { continuation in
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            options.isSynchronous = true
-            if let sourceType = UTType(filenameExtension: ext), sourceType.conforms(to: .rawImage) {
-                options.version = .original
-            } else {
-                options.version = .current
-            }
+    /// Hard ceiling on a single asset's local extraction (Photos/iCloud fetch, or
+    /// passthrough video export). Generous enough that a slow-but-working iCloud
+    /// download of a large video can still complete normally, but bounded: without
+    /// this, a request whose completion handler never fires (a stalled iCloud
+    /// fetch is the common real-world case) hangs `extractCameraRoll` forever. That
+    /// call runs inside NCNetworkingProcess's single-flight foreground timer task,
+    /// so one such asset would wedge every future upload/download/cleanup pass,
+    /// not just this one item.
+    private static let extractionTimeout: Duration = .seconds(300)
 
-            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
-                if let data {
-                    continuation.resume(returning: data)
+    /// Not `Sendable` by nature (`PHImageRequestID` is just an Int32, but this
+    /// keeps the write/read pair explicit); only ever written once, promptly, by
+    /// the request-starting closure, and read later by the timeout closure.
+    private final class RequestIDBox: @unchecked Sendable {
+        var value: PHImageRequestID = PHInvalidImageRequestID
+    }
+
+    /// `withThrowingTaskGroup` requires its result type to be `Sendable`; `AVAsset`
+    /// isn't declared as such, so a value fetched from Photos is carried across
+    /// that boundary inside this box instead of assuming it conforms.
+    private final class UncheckedSendableBox<Value>: @unchecked Sendable {
+        let value: Value
+        init(_ value: Value) { self.value = value }
+    }
+
+    /// Races `operation` against `extractionTimeout`. If the timeout wins,
+    /// `onTimeout` is invoked to actively cancel whatever `operation` started —
+    /// both `PHImageManager.cancelImageRequest` and `AVAssetExportSession.cancelExport()`
+    /// are documented to still invoke the pending completion handler afterwards, so
+    /// the losing side of the race resolves (as a cancellation/error) instead of
+    /// leaking forever, and this function reliably returns either way.
+    private func withExtractionTimeout<T: Sendable>(
+        onTimeout: @escaping @Sendable () -> Void,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(for: Self.extractionTimeout)
+                onTimeout()
+                throw NSError(domain: "ExtractAssetError", code: 9, userInfo: [NSLocalizedDescriptionKey: "Asset extraction timed out"])
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw NSError(domain: "ExtractAssetError", code: 9, userInfo: [NSLocalizedDescriptionKey: "Asset extraction timed out"])
+            }
+            return result
+        }
+    }
+
+    private func extractImage(asset: PHAsset, ext: String, filePath: String, convertToJPEG: Bool) async throws {
+        // PHAsset isn't Sendable; withExtractionTimeout's `operation` closure must be
+        // (it runs as a genuine child task via TaskGroup.addTask), so re-bind it the
+        // same way this file already trusts AVAssetExportSession across that boundary.
+        nonisolated(unsafe) let asset = asset
+        let requestIDBox = RequestIDBox()
+        let imageData: Data = try await withExtractionTimeout(onTimeout: {
+            if requestIDBox.value != PHInvalidImageRequestID {
+                PHImageManager.default().cancelImageRequest(requestIDBox.value)
+            }
+        }) {
+            try await withCheckedThrowingContinuation { continuation in
+                let options = PHImageRequestOptions()
+                options.isNetworkAccessAllowed = true
+                options.deliveryMode = .highQualityFormat
+                options.isSynchronous = true
+                if let sourceType = UTType(filenameExtension: ext), sourceType.conforms(to: .rawImage) {
+                    options.version = .original
                 } else {
-                    continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 2, userInfo: [NSLocalizedDescriptionKey: "Image data is nil"]))
+                    options.version = .current
+                }
+
+                requestIDBox.value = PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                    if let data {
+                        continuation.resume(returning: data)
+                    } else {
+                        continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 2, userInfo: [NSLocalizedDescriptionKey: "Image data is nil"]))
+                    }
                 }
             }
         }
@@ -359,22 +422,32 @@ final class NCCameraRoll: CameraRollExtractor {
     }
 
     private func extractVideo(asset: PHAsset, filePath: String) async throws {
-        let videoAsset: AVAsset = try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.main.async {
-                let options = PHVideoRequestOptions()
-                options.isNetworkAccessAllowed = true
-                options.version = .current
-                options.deliveryMode = .highQualityFormat
+        // See the matching comment in extractImage.
+        nonisolated(unsafe) let asset = asset
+        let requestIDBox = RequestIDBox()
+        let videoAssetBox: UncheckedSendableBox<AVAsset> = try await withExtractionTimeout(onTimeout: {
+            if requestIDBox.value != PHInvalidImageRequestID {
+                PHImageManager.default().cancelImageRequest(requestIDBox.value)
+            }
+        }) {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.main.async {
+                    let options = PHVideoRequestOptions()
+                    options.isNetworkAccessAllowed = true
+                    options.version = .current
+                    options.deliveryMode = .highQualityFormat
 
-                PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { asset, _, _ in
-                    if let asset = asset {
-                        continuation.resume(returning: asset)
-                    } else {
-                        continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Video asset is nil"]))
+                    requestIDBox.value = PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { asset, _, _ in
+                        if let asset = asset {
+                            continuation.resume(returning: UncheckedSendableBox(asset))
+                        } else {
+                            continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Video asset is nil"]))
+                        }
                     }
                 }
             }
         }
+        let videoAsset = videoAssetBox.value
 
         if FileManager.default.fileExists(atPath: filePath) {
             try FileManager.default.removeItem(atPath: filePath)
@@ -396,14 +469,18 @@ final class NCCameraRoll: CameraRollExtractor {
             exporter.shouldOptimizeForNetworkUse = true
             nonisolated(unsafe) let localExporter = exporter
 
-            try await withCheckedThrowingContinuation { continuation in
-                localExporter.exportAsynchronously {
-                    // Avoid capturing non-Sendable 'AVAssetExportSession' by using a nonisolated(unsafe) local binding
-                    let status = localExporter.status
-                    if status == .completed {
-                        continuation.resume()
-                    } else {
-                        continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 5, userInfo: [NSLocalizedDescriptionKey: "Video export failed"]))
+            try await withExtractionTimeout(onTimeout: {
+                localExporter.cancelExport()
+            }) {
+                try await withCheckedThrowingContinuation { continuation in
+                    localExporter.exportAsynchronously {
+                        // Avoid capturing non-Sendable 'AVAssetExportSession' by using a nonisolated(unsafe) local binding
+                        let status = localExporter.status
+                        if status == .completed {
+                            continuation.resume()
+                        } else {
+                            continuation.resume(throwing: NSError(domain: "ExtractAssetError", code: 5, userInfo: [NSLocalizedDescriptionKey: "Video export failed"]))
+                        }
                     }
                 }
             }
